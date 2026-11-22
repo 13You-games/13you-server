@@ -27,8 +27,8 @@ if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
   mailTransporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
-    secure: false, // STARTTLS on port 587
-    family: 4,     // Force IPv4 to avoid cloud IPv6 timeout
+    secure: false,
+    family: 4,
     auth: {
       user: process.env.EMAIL_USER.trim(),
       pass: process.env.EMAIL_PASS.replace(/\s+/g, '')
@@ -138,20 +138,4 @@ app.post('/api/auth/send-otp', async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone || phone.trim().length < 10) {
-      return res.status(400).json({ success: false, message: 'Valid phone number required' });
-    }
-
-    const cleanPhone = phone.trim();
-    const existing = await User.findOne({ phone: cleanPhone });
-    if (existing) {
-      return res.status(400).json({ success: false, message: 'Number already registered. Please Login.' });
-    }
-
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    otpStore.set(cleanPhone, { otp, expiresAt: Date.now() + 5 * 60 * 1000 });
-
-    console.log(`[OTP for ${cleanPhone}]: ${otp}`);
-
-    res.json({
-      success: true,
-      message: 'OTP sent successfully
+      return res.status(400).
