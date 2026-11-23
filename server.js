@@ -366,7 +366,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
-
 // 2. Sign-Up with Name + DOB (18+) + Phone + Password + Optional Gmail + OTP
 app.post('/api/auth/signup', async (req, res) => {
   try {
@@ -597,3 +596,119 @@ app.post('/api/auth/email-approve', async (req, res) => {
         isAdultVerified: true,
         balance: 50,
         transactions: [{ type: 'credit', amount: 50, reason: 'welcome_bonus' }]
+      });
+    }
+
+    record.status = 'approved';
+    record.userId = user._id.toString();
+    emailApprovalStore.set(token, record);
+
+    return res.send(`
+      <html><body style="font-family:sans-serif;background:#111;color:#fff;text-align:center;padding:50px;">
+        <h2 style="color:#4caf50;">Login Approved!</h2>
+        <p>You can now return to the game. You will be logged in automatically.</p>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error('[email-approve POST error]:', err);
+    return res.status(500).send('Server error while approving login.');
+  }
+});
+
+// 3C. Poll Email Approval Status from Game
+app.get('/api/auth/email-status', async (req, res) => {
+  try {
+    const token = req.query && req.query.token ? String(req.query.token).trim() : '';
+    if (!token) {
+      return res.status(400).json({ success: false, message: 'Token required' });
+    }
+
+    const record = emailApprovalStore.get(token);
+    if (!record) {
+      return res.json({ success: false, message: 'Token not found or expired' });
+    }
+
+    if (Date.now() > record.expiresAt) {
+      emailApprovalStore.delete(token);
+      return res.json({ success: false, message: 'Approval link expired' });
+    }
+
+    if (record.status !== 'approved' || !record.userId) {
+      return res.json({ success: false, message: 'Waiting for approval...' });
+    }
+
+    const user = await User.findById(record.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // One-time login consumption
+    emailApprovalStore.delete(token);
+
+    return res.json({
+      success: true,
+      message: 'Email login approved',
+      user: formatUserResponse(user)
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 4. Get Wallet Balance
+app.get('/api/wallet/:userId', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId).select('phone name balance transactions');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    res.json({
+      success: true,
+      balance: user.balance,
+      transactions: user.transactions.slice(-20)
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 5. Adjust Balance (credit / debit)
+app.post('/api/wallet/adjust', async (req, res) => {
+  try {
+    const { userId, type, amount, reason } = req.body;
+    const numericAmount = Number(amount);
+
+    if (!userId || !['credit', 'debit'].includes(type) || !numericAmount || numericAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid request fields' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if (type === 'debit' && user.balance < numericAmount) {
+      return res.status(400).json({ success: false, message: 'Insufficient balance' });
+    }
+
+    user.balance = type === 'credit' ? user.balance + numericAmount : user.balance - numericAmount;
+    user.transactions.push({
+      type,
+      amount: numericAmount,
+      reason: reason || 'game_action'
+    });
+
+    await user.save();
+
+    res.json({
+      success: true,
+      balance: user.balance
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+});
