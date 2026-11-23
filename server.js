@@ -3,6 +3,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -20,10 +21,28 @@ mongoose
   .then(() => console.log('MongoDB connected'))
   .catch((err) => console.log('MongoDB connection note:', err.message));
 
+// OTP Flow config
+const OTPFLOW_API_KEY = (process.env.OTPFLOW_API_KEY || '').trim();
+const OTPFLOW_SEND_URL = 'https://otpflow.in/send-otp';
+const OTPFLOW_VERIFY_URL = 'https://otpflow.in/verify-otp';
+
+// Email transporter setup (Gmail SMTP with App Password)
+let mailTransporter = null;
+if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+  mailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.EMAIL_USER.trim(),
+      pass: process.env.EMAIL_PASS.trim().replace(/\s+/g, '')
+    }
+  });
+}
+
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password).digest('hex');
 }
 
+// Accepts "DD/MM/YYYY", "DD-MM-YYYY", or "YYYY-MM-DD"
 function parseDob(dobStr) {
   if (!dobStr || typeof dobStr !== 'string') return null;
   const trimmed = dobStr.trim();
@@ -69,27 +88,78 @@ function getBaseServerUrl(req) {
   return `${proto}://${req.get('host')}`;
 }
 
+function normalizeIndianPhone(rawPhone) {
+  const digits = String(rawPhone || '').replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) {
+    return digits.slice(2);
+  }
+  if (digits.length === 11 && digits.startsWith('0')) {
+    return digits.slice(1);
+  }
+  return digits;
+}
+
+async function callOtpFlowSend({ number, purpose = 'login', ttl = 10, otpLength = 6 }) {
+  if (!OTPFLOW_API_KEY) {
+    throw new Error('OTPFLOW_API_KEY is missing in environment variables');
+  }
+
+  const res = await fetch(OTPFLOW_SEND_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OTPFLOW_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      number,
+      purpose,
+      ttl,
+      otp_length: otpLength
+    })
+  });
+
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function callOtpFlowVerify({ otpId, otp }) {
+  if (!OTPFLOW_API_KEY) {
+    throw new Error('OTPFLOW_API_KEY is missing in environment variables');
+  }
+
+  const res = await fetch(OTPFLOW_VERIFY_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OTPFLOW_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      otp_id: otpId,
+      otp: String(otp).trim()
+    })
+  });
+
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
 async function sendApprovalEmailViaBrevo({ toEmail, approveUrl, appName }) {
   const apiKey = (process.env.BREVO_API_KEY || '').trim();
   const senderEmail = (process.env.SENDER_EMAIL || process.env.EMAIL_USER || '').trim();
   const senderName = (process.env.SENDER_NAME || appName || '13 You Games').trim();
 
   if (!apiKey || !senderEmail) {
-    throw new Error('BREVO_API_KEY or SENDER_EMAIL/EMAIL_USER is missing in environment variables');
+    return false;
   }
 
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
-      'accept': 'application/json',
       'api-key': apiKey,
-      'content-type': 'application/json'
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      sender: {
-        name: senderName,
-        email: senderEmail
-      },
+      sender: { name: senderName, email: senderEmail },
       to: [{ email: toEmail }],
       subject: `${appName} - Confirm your login`,
       htmlContent: `
@@ -108,13 +178,12 @@ async function sendApprovalEmailViaBrevo({ toEmail, approveUrl, appName }) {
     })
   });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Brevo API error (${response.status}): ${errText}`);
-  }
+  return res.ok;
 }
 
+// cleanPhone -> { otpId, purpose, expiresAt }
 const otpStore = new Map();
+// token -> { email, status: 'pending' | 'approved', expiresAt, userId }
 const emailApprovalStore = new Map();
 
 const transactionSchema = new mongoose.Schema({
@@ -157,34 +226,148 @@ app.get('/', (req, res) => {
   res.json({ status: 'OK', message: '13 You Games Server is running!' });
 });
 
+// 1. Send SMS OTP via OTP Flow (works for both signup & login)
 app.post('/api/auth/send-otp', async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone || phone.trim().length < 10) {
-      return res.status(400).json({ success: false, message: 'Valid phone number required' });
+    const cleanPhone = normalizeIndianPhone(req.body && (req.body.phone || req.body.number));
+    const purpose = String((req.body && req.body.purpose) || 'login').trim() || 'login';
+
+    if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid 10-digit Indian mobile number required'
+      });
     }
 
-    const cleanPhone = phone.trim();
-    const existing = await User.findOne({ phone: cleanPhone });
-    if (existing) {
-      return res.status(400).json({ success: false, message: 'Number already registered. Please Login.' });
+    const { ok, status, data } = await callOtpFlowSend({
+      number: cleanPhone,
+      purpose,
+      ttl: 10,
+      otpLength: 6
+    });
+
+    if (!ok || !data || data.success === false || !data.otp_id) {
+      console.error('[send-otp provider error]:', status, data);
+      return res.status(status >= 400 ? status : 400).json({
+        success: false,
+        message: (data && (data.message || data.error)) || 'Failed to send OTP via OTP Flow'
+      });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    otpStore.set(cleanPhone, { otp, expiresAt: Date.now() + 5 * 60 * 1000 });
+    const expiresAt = data.expires_at ? new Date(data.expires_at).getTime() : Date.now() + 10 * 60 * 1000;
+    otpStore.set(cleanPhone, {
+      otpId: data.otp_id,
+      purpose,
+      expiresAt: Number.isNaN(expiresAt) ? Date.now() + 10 * 60 * 1000 : expiresAt
+    });
 
-    console.log(`[OTP for ${cleanPhone}]: ${otp}`);
-
-    res.json({
+    return res.json({
       success: true,
-      message: 'OTP sent successfully',
-      devOtp: otp
+      message: data.message || 'OTP sent successfully',
+      expires_at: data.expires_at || null
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[send-otp error]:', err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
+// 1B. Verify SMS OTP via OTP Flow & Login / Create User
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const cleanPhone = normalizeIndianPhone(req.body && (req.body.phone || req.body.number));
+    const otp = req.body && req.body.otp ? String(req.body.otp).trim() : '';
+    const name = req.body && req.body.name ? String(req.body.name).trim() : '';
+    const dob = req.body && req.body.dob ? String(req.body.dob).trim() : '';
+    const email = req.body && req.body.email ? String(req.body.email).trim().toLowerCase() : '';
+
+    if (!/^[6-9]\d{9}$/.test(cleanPhone) || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid 10-digit phone number and OTP are required'
+      });
+    }
+
+    const record = otpStore.get(cleanPhone);
+    if (!record || !record.otpId) {
+      return res.status(400).json({
+        success: false,
+        message: 'No active OTP session found. Click Get OTP first.'
+      });
+    }
+
+    if (Date.now() > record.expiresAt) {
+      otpStore.delete(cleanPhone);
+      return res.status(400).json({
+        success: false,
+        message: 'OTP expired. Click Get OTP again.'
+      });
+    }
+
+    const { ok, status, data } = await callOtpFlowVerify({
+      otpId: record.otpId,
+      otp
+    });
+
+    if (!ok || !data || data.success === false) {
+      return res.status(status >= 400 ? status : 400).json({
+        success: false,
+        message: (data && (data.message || data.error)) || 'Invalid OTP'
+      });
+    }
+
+    otpStore.delete(cleanPhone);
+
+    let user = await User.findOne({ phone: cleanPhone });
+    let isNewUser = false;
+
+    if (!user) {
+      let parsedDob = getDefaultAdultDob();
+      if (dob) {
+        const checkDob = parseDob(dob);
+        if (!checkDob) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid DOB format. Use DD/MM/YYYY'
+          });
+        }
+        if (calculateAge(checkDob) < 18) {
+          return res.status(400).json({
+            success: false,
+            message: '18+ age required to sign up'
+          });
+        }
+        parsedDob = checkDob;
+      }
+
+      isNewUser = true;
+      user = await User.create({
+        name: name || `Player_${cleanPhone.slice(-4)}`,
+        dob: parsedDob,
+        isAdultVerified: true,
+        phone: cleanPhone,
+        email,
+        balance: 50,
+        transactions: [{ type: 'credit', amount: 50, reason: 'welcome_bonus' }]
+      });
+    } else if (email && !user.email) {
+      user.email = email;
+      await user.save();
+    }
+
+    return res.json({
+      success: true,
+      message: data.message || 'OTP verified',
+      isNewUser,
+      user: formatUserResponse(user)
+    });
+  } catch (err) {
+    console.error('[verify-otp error]:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 2. Sign-Up with Name + DOB (18+) + Phone + Password + Optional Gmail + OTP
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { name, dob, phone, password, email, otp } = req.body;
@@ -206,20 +389,32 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ success: false, message: '18+ age required to sign up' });
     }
 
-    const cleanPhone = phone.trim();
-    const record = otpStore.get(cleanPhone);
-
-    if (!record || Date.now() > record.expiresAt) {
-      return res.status(400).json({ success: false, message: 'OTP expired. Click Get OTP again.' });
-    }
-
-    if (record.otp !== otp.toString().trim()) {
-      return res.status(400).json({ success: false, message: 'Invalid OTP' });
+    const cleanPhone = normalizeIndianPhone(phone);
+    if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
+      return res.status(400).json({ success: false, message: 'Valid 10-digit Indian mobile number required' });
     }
 
     const existing = await User.findOne({ phone: cleanPhone });
     if (existing) {
       return res.status(400).json({ success: false, message: 'Account already exists' });
+    }
+
+    const record = otpStore.get(cleanPhone);
+    if (!record || !record.otpId || Date.now() > record.expiresAt) {
+      if (record) otpStore.delete(cleanPhone);
+      return res.status(400).json({ success: false, message: 'OTP expired. Click Get OTP again.' });
+    }
+
+    const { ok, status, data } = await callOtpFlowVerify({
+      otpId: record.otpId,
+      otp: otp.toString().trim()
+    });
+
+    if (!ok || !data || data.success === false) {
+      return res.status(status >= 400 ? status : 400).json({
+        success: false,
+        message: (data && (data.message || data.error)) || 'Invalid OTP'
+      });
     }
 
     otpStore.delete(cleanPhone);
@@ -245,6 +440,7 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
+// 3. Login with Phone + Password
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { phone, password } = req.body;
@@ -252,7 +448,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Phone and password are required' });
     }
 
-    const cleanPhone = phone.trim();
+    const cleanPhone = normalizeIndianPhone(phone);
     const user = await User.findOne({ phone: cleanPhone });
 
     if (!user) {
@@ -273,6 +469,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// 3A. Request Email Approval Link ("Yes, it's me")
 app.post('/api/auth/email-request', async (req, res) => {
   try {
     const rawEmail = req.body && req.body.email ? String(req.body.email).trim().toLowerCase() : '';
@@ -281,7 +478,7 @@ app.post('/api/auth/email-request', async (req, res) => {
     }
 
     const token = crypto.randomBytes(24).toString('hex');
-    const expiresAt = Date.now() + 10 * 60 * 1000;
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
     const approveUrl = `${getBaseServerUrl(req)}/api/auth/email-approve?token=${token}`;
 
     emailApprovalStore.set(token, {
@@ -292,11 +489,36 @@ app.post('/api/auth/email-request', async (req, res) => {
     });
 
     const appName = process.env.APP_NAME || '13 You Games';
-    await sendApprovalEmailViaBrevo({
+    const sentViaBrevo = await sendApprovalEmailViaBrevo({
       toEmail: rawEmail,
       approveUrl,
       appName
     });
+
+    if (!sentViaBrevo) {
+      if (mailTransporter) {
+        await mailTransporter.sendMail({
+          from: `"${appName}" <${process.env.EMAIL_USER.trim()}>`,
+          to: rawEmail,
+          subject: `${appName} - Confirm your login`,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #141414; color: #ffffff; border-radius: 10px;">
+              <h2 style="margin-top: 0; color: #f5c542;">${appName} Login Request</h2>
+              <p>Someone requested to log into <b>${appName}</b> using <b>${rawEmail}</b>.</p>
+              <p>If this was you, tap the button below to approve your login:</p>
+              <p style="margin: 24px 0;">
+                <a href="${approveUrl}" style="display: inline-block; padding: 12px 22px; background: #f5c542; color: #111111; text-decoration: none; font-weight: bold; border-radius: 6px;">
+                  Yes, it's me
+                </a>
+              </p>
+              <p style="font-size: 12px; color: #aaaaaa;">This link expires in 10 minutes. If you did not request this, ignore this email.</p>
+            </div>
+          `
+        });
+      } else {
+        console.log(`[Email Approval Link for ${rawEmail}]: ${approveUrl}`);
+      }
+    }
 
     res.json({
       success: true,
@@ -309,6 +531,7 @@ app.post('/api/auth/email-request', async (req, res) => {
   }
 });
 
+// 3B. Approval Page ("Yes, it's me")
 app.get('/api/auth/email-approve', async (req, res) => {
   const token = req.query && req.query.token ? String(req.query.token).trim() : '';
   const record = token ? emailApprovalStore.get(token) : null;
@@ -374,115 +597,3 @@ app.post('/api/auth/email-approve', async (req, res) => {
         isAdultVerified: true,
         balance: 50,
         transactions: [{ type: 'credit', amount: 50, reason: 'welcome_bonus' }]
-      });
-    }
-
-    record.status = 'approved';
-    record.userId = user._id.toString();
-    emailApprovalStore.set(token, record);
-
-    return res.send(`
-      <html><body style="font-family:sans-serif;background:#111;color:#fff;text-align:center;padding:50px;">
-        <h2 style="color:#4caf50;">Login Approved!</h2>
-        <p>You can now return to the game. You will be logged in automatically.</p>
-      </body></html>
-    `);
-  } catch (err) {
-    console.error('[email-approve POST error]:', err);
-    return res.status(500).send('Server error while approving login.');
-  }
-});
-
-app.get('/api/auth/email-status', async (req, res) => {
-  try {
-    const token = req.query && req.query.token ? String(req.query.token).trim() : '';
-    if (!token) {
-      return res.status(400).json({ success: false, message: 'Token required' });
-    }
-
-    const record = emailApprovalStore.get(token);
-    if (!record) {
-      return res.json({ success: false, message: 'Token not found or expired' });
-    }
-
-    if (Date.now() > record.expiresAt) {
-      emailApprovalStore.delete(token);
-      return res.json({ success: false, message: 'Approval link expired' });
-    }
-
-    if (record.status !== 'approved' || !record.userId) {
-      return res.json({ success: false, message: 'Waiting for approval...' });
-    }
-
-    const user = await User.findById(record.userId);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    emailApprovalStore.delete(token);
-
-    return res.json({
-      success: true,
-      message: 'Email login approved',
-      user: formatUserResponse(user)
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.get('/api/wallet/:userId', async (req, res) => {
-  try {
-    const user = await User.findById(req.params.userId).select('phone name balance transactions');
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    res.json({
-      success: true,
-      balance: user.balance,
-      transactions: user.transactions.slice(-20)
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.post('/api/wallet/adjust', async (req, res) => {
-  try {
-    const { userId, type, amount, reason } = req.body;
-    const numericAmount = Number(amount);
-
-    if (!userId || !['credit', 'debit'].includes(type) || !numericAmount || numericAmount <= 0) {
-      return res.status(400).json({ success: false, message: 'Invalid request fields' });
-    }
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    if (type === 'debit' && user.balance < numericAmount) {
-      return res.status(400).json({ success: false, message: 'Insufficient balance' });
-    }
-
-    user.balance = type === 'credit' ? user.balance + numericAmount : user.balance - numericAmount;
-    user.transactions.push({
-      type,
-      amount: numericAmount,
-      reason: reason || 'game_action'
-    });
-
-    await user.save();
-
-    res.json({
-      success: true,
-      balance: user.balance
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
