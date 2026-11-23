@@ -709,6 +709,51 @@ app.post('/api/wallet/adjust', async (req, res) => {
   }
 });
 
+// Live Chat Store: roomId -> array of messages
+const chatRoomsStore = new Map();
+
+// Send live chat message
+app.post('/api/chat/send', (req, res) => {
+  try {
+    const roomId = String((req.body && req.body.roomId) || 'support_default').trim();
+    const senderName = String((req.body && req.body.senderName) || 'Player').trim().slice(0, 24);
+    const message = String((req.body && req.body.message) || '').trim().slice(0, 250);
+
+    if (!message) {
+      return res.status(400).json({ success: false, message: 'Message cannot be empty' });
+    }
+
+    const msgObj = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      roomId,
+      senderName,
+      message,
+      createdAt: Date.now()
+    };
+
+    const list = chatRoomsStore.get(roomId) || [];
+    list.push(msgObj);
+    if (list.length > 50) list.shift();
+    chatRoomsStore.set(roomId, list);
+
+    return res.json({ success: true, chat: msgObj });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Fetch live chat messages for a room
+app.get('/api/chat/:roomId', (req, res) => {
+  try {
+    const roomId = String(req.params.roomId || 'support_default').trim();
+    const list = chatRoomsStore.get(roomId) || [];
+    return res.json({ success: true, messages: list });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
+
