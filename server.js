@@ -188,10 +188,24 @@ const emailApprovalStore = new Map();
 // roomId -> array of chat messages
 const chatRoomsStore = new Map();
 
+function getKeywordFallbackReply(userMsg) {
+  const q = String(userMsg || '').toLowerCase();
+  if (q.includes('withdraw')) {
+    return 'Minimum withdrawal Rs. 500 hai. UPI ya Bank details sahi bhar kar submit karein.';
+  }
+  if (q.includes('deposit') || q.includes('add') || q.includes('utr') || q.includes('qr')) {
+    return 'Add Cash mein QR/UPI se payment karke UTR submit karein, verify hote hi balance update ho jaayega.';
+  }
+  if (q.includes('how to play') || q.includes('game') || q.includes('rule') || q.includes('khele')) {
+    return 'Lobby se game ya cricket mode chunein, apna stake/bet lagayein aur live round ka result dekhein.';
+  }
+  return 'Aapka message mil gaya hai. Support team jald hi aapki query check karegi.';
+}
+
 async function getSupportAutoReply(userMsg) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
-    return 'Aapka message mil gaya hai. Support team jald hi aapki query check karegi.';
+    return getKeywordFallbackReply(userMsg);
   }
 
   try {
@@ -215,7 +229,9 @@ async function getSupportAutoReply(userMsg) {
     );
 
     if (!response.ok) {
-      return 'Abhi support bot busy hai, kripya thodi der baad dobara poochein.';
+      const errText = await response.text().catch(() => '');
+      console.error('[Gemini API error]:', response.status, errText);
+      return getKeywordFallbackReply(userMsg);
     }
 
     const data = await response.json();
@@ -228,9 +244,10 @@ async function getSupportAutoReply(userMsg) {
       data.candidates[0].content.parts[0] &&
       data.candidates[0].content.parts[0].text;
 
-    return (reply && reply.trim()) || 'Aapka message mil gaya hai, hum jald jawab denge.';
+    return (reply && reply.trim()) || getKeywordFallbackReply(userMsg);
   } catch (err) {
-    return 'Network issue ki wajah se abhi auto-reply nahi aa paaya, thodi der baad try karein.';
+    console.error('[Gemini fetch failed]:', err.message);
+    return getKeywordFallbackReply(userMsg);
   }
 }
 
@@ -516,6 +533,7 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 // 3A. Request Email Approval Link ("Yes, it's me")
 app.post('/api/auth/email-request', async (req, res) => {
   try {
