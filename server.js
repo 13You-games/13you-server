@@ -185,6 +185,54 @@ async function sendApprovalEmailViaBrevo({ toEmail, approveUrl, appName }) {
 const otpStore = new Map();
 // token -> { email, status: 'pending' | 'approved', expiresAt, userId }
 const emailApprovalStore = new Map();
+// roomId -> array of chat messages
+const chatRoomsStore = new Map();
+
+async function getSupportAutoReply(userMsg) {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) {
+    return 'Aapka message mil gaya hai. Support team jald hi aapki query check karegi.';
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `You are a helpful customer support assistant for "13 YOU GAMES" (a mobile card/cricket game app with welcome bonus Rs. 50, minimum withdrawal Rs. 500, UPI/Bank withdrawal, Add Cash via QR/UTR, bonus, referral, promocode). Reply concisely, politely, and in simple Hinglish/Hindi matching the user's language. User message: ${userMsg}`
+                }
+              ]
+            }
+          ]
+        })
+      }
+    );
+
+    if (!response.ok) {
+      return 'Abhi support bot busy hai, kripya thodi der baad dobara poochein.';
+    }
+
+    const data = await response.json();
+    const reply =
+      data &&
+      data.candidates &&
+      data.candidates[0] &&
+      data.candidates[0].content &&
+      data.candidates[0].content.parts &&
+      data.candidates[0].content.parts[0] &&
+      data.candidates[0].content.parts[0].text;
+
+    return (reply && reply.trim()) || 'Aapka message mil gaya hai, hum jald jawab denge.';
+  } catch (err) {
+    return 'Network issue ki wajah se abhi auto-reply nahi aa paaya, thodi der baad try karein.';
+  }
+}
 
 const transactionSchema = new mongoose.Schema({
   type: { type: String, enum: ['credit', 'debit'], required: true },
@@ -366,6 +414,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
+
 // 2. Sign-Up with Name + DOB (18+) + Phone + Password + Optional Gmail + OTP
 app.post('/api/auth/signup', async (req, res) => {
   try {
@@ -467,7 +516,6 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
 // 3A. Request Email Approval Link ("Yes, it's me")
 app.post('/api/auth/email-request', async (req, res) => {
   try {
@@ -477,7 +525,7 @@ app.post('/api/auth/email-request', async (req, res) => {
     }
 
     const token = crypto.randomBytes(24).toString('hex');
-    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const expiresAt = Date.now() + 10 * 60 * 1000;
     const approveUrl = `${getBaseServerUrl(req)}/api/auth/email-approve?token=${token}`;
 
     emailApprovalStore.set(token, {
@@ -642,7 +690,6 @@ app.get('/api/auth/email-status', async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    // One-time login consumption
     emailApprovalStore.delete(token);
 
     return res.json({
@@ -709,11 +756,8 @@ app.post('/api/wallet/adjust', async (req, res) => {
   }
 });
 
-// Live Chat Store: roomId -> array of messages
-const chatRoomsStore = new Map();
-
-// Send live chat message
-app.post('/api/chat/send', (req, res) => {
+// 6. Send live chat message + AI support reply
+app.post('/api/chat/send', async (req, res) => {
   try {
     const roomId = String((req.body && req.body.roomId) || 'support_default').trim();
     const senderName = String((req.body && req.body.senderName) || 'Player').trim().slice(0, 24);
@@ -734,6 +778,19 @@ app.post('/api/chat/send', (req, res) => {
     const list = chatRoomsStore.get(roomId) || [];
     list.push(msgObj);
     if (list.length > 50) list.shift();
+
+    const replyText = await getSupportAutoReply(message);
+    if (replyText) {
+      list.push({
+        id: `${Date.now()}_bot_${Math.random().toString(36).slice(2, 6)}`,
+        roomId,
+        senderName: 'Hira (Support)',
+        message: replyText,
+        createdAt: Date.now() + 10
+      });
+      if (list.length > 50) list.shift();
+    }
+
     chatRoomsStore.set(roomId, list);
 
     return res.json({ success: true, chat: msgObj });
@@ -742,7 +799,7 @@ app.post('/api/chat/send', (req, res) => {
   }
 });
 
-// Fetch live chat messages for a room
+// 7. Fetch live chat messages for a room
 app.get('/api/chat/:roomId', (req, res) => {
   try {
     const roomId = String(req.params.roomId || 'support_default').trim();
@@ -756,4 +813,3 @@ app.get('/api/chat/:roomId', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
-
