@@ -3,7 +3,6 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -20,24 +19,6 @@ mongoose
   .connect(MONGO_URI)
   .then(() => console.log('MongoDB connected'))
   .catch((err) => console.log('MongoDB connection note:', err.message));
-
-// Email transporter setup (Gmail SMTP with IPv4 & STARTTLS port 587)
-let mailTransporter = null;
-if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-  mailTransporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,
-    family: 4,
-    auth: {
-      user: process.env.EMAIL_USER.trim(),
-      pass: process.env.EMAIL_PASS.replace(/\s+/g, '')
-    },
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000
-  });
-}
 
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password).digest('hex');
@@ -86,6 +67,51 @@ function getBaseServerUrl(req) {
   }
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
   return `${proto}://${req.get('host')}`;
+}
+
+async function sendApprovalEmailViaBrevo({ toEmail, approveUrl, appName }) {
+  const apiKey = (process.env.BREVO_API_KEY || '').trim();
+  const senderEmail = (process.env.SENDER_EMAIL || process.env.EMAIL_USER || '').trim();
+  const senderName = (process.env.SENDER_NAME || appName || '13 You Games').trim();
+
+  if (!apiKey || !senderEmail) {
+    throw new Error('BREVO_API_KEY or SENDER_EMAIL/EMAIL_USER is missing in environment variables');
+  }
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'api-key': apiKey,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      sender: {
+        name: senderName,
+        email: senderEmail
+      },
+      to: [{ email: toEmail }],
+      subject: `${appName} - Confirm your login`,
+      htmlContent: `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #141414; color: #ffffff; border-radius: 10px;">
+          <h2 style="margin-top: 0; color: #f5c542;">${appName} Login Request</h2>
+          <p>Someone requested to log into <b>${appName}</b> using <b>${toEmail}</b>.</p>
+          <p>If this was you, tap the button below to approve your login:</p>
+          <p style="margin: 24px 0;">
+            <a href="${approveUrl}" style="display: inline-block; padding: 12px 22px; background: #f5c542; color: #111111; text-decoration: none; font-weight: bold; border-radius: 6px;">
+              Yes, it's me
+            </a>
+          </p>
+          <p style="font-size: 12px; color: #aaaaaa;">This link expires in 10 minutes. If you did not request this, ignore this email.</p>
+        </div>
+      `
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Brevo API error (${response.status}): ${errText}`);
+  }
 }
 
 const otpStore = new Map();
@@ -266,29 +292,11 @@ app.post('/api/auth/email-request', async (req, res) => {
     });
 
     const appName = process.env.APP_NAME || '13 You Games';
-
-    if (mailTransporter) {
-      await mailTransporter.sendMail({
-        from: `"${appName}" <${process.env.EMAIL_USER.trim()}>`,
-        to: rawEmail,
-        subject: `${appName} - Confirm your login`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #141414; color: #ffffff; border-radius: 10px;">
-            <h2 style="margin-top: 0; color: #f5c542;">${appName} Login Request</h2>
-            <p>Someone requested to log into <b>${appName}</b> using <b>${rawEmail}</b>.</p>
-            <p>If this was you, tap the button below to approve your login:</p>
-            <p style="margin: 24px 0;">
-              <a href="${approveUrl}" style="display: inline-block; padding: 12px 22px; background: #f5c542; color: #111111; text-decoration: none; font-weight: bold; border-radius: 6px;">
-                Yes, it's me
-              </a>
-            </p>
-            <p style="font-size: 12px; color: #aaaaaa;">This link expires in 10 minutes. If you did not request this, ignore this email.</p>
-          </div>
-        `
-      });
-    } else {
-      console.log(`[Email Approval Link for ${rawEmail}]: ${approveUrl}`);
-    }
+    await sendApprovalEmailViaBrevo({
+      toEmail: rawEmail,
+      approveUrl,
+      appName
+    });
 
     res.json({
       success: true,
