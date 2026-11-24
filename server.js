@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Atlas connection
+// MongoDB Atlas connection (use MONGO_URI env variable in Render/production)
 const MONGO_URI =
   process.env.MONGO_URI ||
   'mongodb+srv://13yougames_db_user:ThirteenYou6978@cluster0.pgdm4sz.mongodb.net/13you_db?retryWrites=true&w=majority';
@@ -26,7 +26,7 @@ const OTPFLOW_API_KEY = (process.env.OTPFLOW_API_KEY || '').trim();
 const OTPFLOW_SEND_URL = 'https://otpflow.in/send-otp';
 const OTPFLOW_VERIFY_URL = 'https://otpflow.in/verify-otp';
 
-// Email transporter setup (Gmail SMTP with App Password)
+// Email transporter setup (Gmail SMTP fallback)
 let mailTransporter = null;
 if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
   mailTransporter = nodemailer.createTransport({
@@ -42,7 +42,6 @@ function hashPassword(password) {
   return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-// Accepts "DD/MM/YYYY", "DD-MM-YYYY", or "YYYY-MM-DD"
 function parseDob(dobStr) {
   if (!dobStr || typeof dobStr !== 'string') return null;
   const trimmed = dobStr.trim();
@@ -181,11 +180,8 @@ async function sendApprovalEmailViaBrevo({ toEmail, approveUrl, appName }) {
   return res.ok;
 }
 
-// cleanPhone -> { otpId, purpose, expiresAt }
 const otpStore = new Map();
-// token -> { email, status: 'pending' | 'approved', expiresAt, userId }
 const emailApprovalStore = new Map();
-// roomId -> array of chat messages
 const chatRoomsStore = new Map();
 
 function getKeywordFallbackReply(userMsg) {
@@ -258,6 +254,15 @@ const transactionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+const gameHistorySchema = new mongoose.Schema({
+  game: { type: String, default: 'andar_bahar' },
+  roundName: { type: String, default: '' },
+  side: { type: String, default: '' },
+  amount: { type: Number, default: 0 },
+  status: { type: String, default: 'Played' },
+  createdAt: { type: Date, default: Date.now }
+});
+
 const userSchema = new mongoose.Schema(
   {
     firebaseUid: { type: String, unique: true, sparse: true },
@@ -268,7 +273,11 @@ const userSchema = new mongoose.Schema(
     dob: { type: Date, default: getDefaultAdultDob },
     isAdultVerified: { type: Boolean, default: false },
     balance: { type: Number, default: 50, min: 0 },
-    transactions: [transactionSchema]
+    dailyStreak: { type: Number, default: 0, min: 0 },
+    lastDailyClaimAt: { type: Date, default: null },
+    usedPromos: { type: [String], default: [] },
+    transactions: [transactionSchema],
+    gameHistory: [gameHistorySchema]
   },
   { timestamps: true }
 );
@@ -283,7 +292,8 @@ function formatUserResponse(user) {
     isAdultVerified: Boolean(user.isAdultVerified),
     phone: user.phone || '',
     email: user.email || '',
-    balance: Number(user.balance || 0)
+    balance: Number(user.balance || 0),
+    dailyStreak: Number(user.dailyStreak || 0)
   };
 }
 
@@ -291,7 +301,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'OK', message: '13 You Games Server is running!' });
 });
 
-// 1. Send SMS OTP via OTP Flow (works for both signup & login)
+// 1. Send SMS OTP via OTP Flow
 app.post('/api/auth/send-otp', async (req, res) => {
   try {
     const cleanPhone = normalizeIndianPhone(req.body && (req.body.phone || req.body.number));
@@ -504,7 +514,6 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
 // 3. Login with Phone + Password
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -729,8 +738,8 @@ app.get('/api/wallet/:userId', async (req, res) => {
     }
     res.json({
       success: true,
-      balance: user.balance,
-      transactions: user.transactions.slice(-20)
+      balance: Number(user.balance || 0),
+      transactions: (user.transactions || []).slice(-20)
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -757,24 +766,242 @@ app.post('/api/wallet/adjust', async (req, res) => {
     }
 
     user.balance = type === 'credit' ? user.balance + numericAmount : user.balance - numericAmount;
-    user.transactions.push({
+    user.transactions.unshift({
       type,
       amount: numericAmount,
-      reason: reason || 'game_action'
+      reason: reason || 'game_action',
+      createdAt: new Date()
     });
 
     await user.save();
 
     res.json({
       success: true,
-      balance: user.balance
+      balance: Number(user.balance || 0)
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+// 6. Daily Bonus Status & Claim (24h cooldown, 7-day rewards)
+const DAILY_REWARDS = [10, 15, 20, 25, 30, 40, 50];
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-// 6. Send live chat message + AI support reply
+app.get('/api/bonus/daily-status/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const now = Date.now();
+    const lastClaimMs = user.lastDailyClaimAt ? new Date(user.lastDailyClaimAt).getTime() : 0;
+    const elapsed = lastClaimMs > 0 ? now - lastClaimMs : DAY_MS;
+    const canClaim = elapsed >= DAY_MS;
+    const remainingMs = canClaim ? 0 : DAY_MS - elapsed;
+    const dayIndex = Number(user.dailyStreak || 0) % DAILY_REWARDS.length;
+
+    return res.json({
+      success: true,
+      canClaim,
+      remainingSeconds: Math.ceil(remainingMs / 1000),
+      dayIndex,
+      rewardAmount: DAILY_REWARDS[dayIndex],
+      balance: Number(user.balance || 0)
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/bonus/daily-claim', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const now = Date.now();
+    const lastClaimMs = user.lastDailyClaimAt ? new Date(user.lastDailyClaimAt).getTime() : 0;
+    const elapsed = lastClaimMs > 0 ? now - lastClaimMs : DAY_MS;
+
+    if (elapsed < DAY_MS) {
+      const remainingSeconds = Math.ceil((DAY_MS - elapsed) / 1000);
+      return res.status(400).json({
+        success: false,
+        message: 'Daily bonus already claimed today',
+        remainingSeconds,
+        balance: Number(user.balance || 0)
+      });
+    }
+
+    const dayIndex = Number(user.dailyStreak || 0) % DAILY_REWARDS.length;
+    const reward = DAILY_REWARDS[dayIndex];
+
+    user.balance = Number(user.balance || 0) + reward;
+    user.dailyStreak = (Number(user.dailyStreak || 0) + 1) % DAILY_REWARDS.length;
+    user.lastDailyClaimAt = new Date(now);
+    user.transactions.unshift({
+      type: 'credit',
+      amount: reward,
+      reason: `daily_bonus_day_${dayIndex + 1}`,
+      createdAt: new Date(now)
+    });
+
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: `Claimed Rs. ${reward} daily bonus`,
+      reward,
+      balance: Number(user.balance || 0),
+      nextDayIndex: user.dailyStreak
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 7. Promocode Apply
+const PROMO_CODES = {
+  WELCOME100: 100,
+  BONUS50: 50,
+  DIWALI100: 100
+};
+
+app.post('/api/promo/apply', async (req, res) => {
+  try {
+    const { userId, code } = req.body || {};
+    const cleanCode = String(code || '').trim().toUpperCase();
+
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+    if (!cleanCode || !PROMO_CODES[cleanCode]) {
+      return res.status(400).json({ success: false, message: 'Invalid promocode' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if ((user.usedPromos || []).includes(cleanCode)) {
+      return res.status(400).json({ success: false, message: 'Promocode already used' });
+    }
+
+    const bonus = PROMO_CODES[cleanCode];
+    user.balance = Number(user.balance || 0) + bonus;
+    user.usedPromos.push(cleanCode);
+    user.transactions.unshift({
+      type: 'credit',
+      amount: bonus,
+      reason: `promo_${cleanCode.toLowerCase()}`,
+      createdAt: new Date()
+    });
+
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: `Promocode ${cleanCode} applied`,
+      bonus,
+      balance: Number(user.balance || 0)
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 8. Referral Info
+app.get('/api/referral/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    const user = await User.findById(userId).select('_id name');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    return res.json({
+      success: true,
+      referralCode: user._id.toString(),
+      referralLink: `https://13yougames.com/ref=${user._id.toString()}`
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 9. Game History Log & Fetch
+app.post('/api/history/game', async (req, res) => {
+  try {
+    const { userId, game, roundName, side, amount, status } = req.body || {};
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    user.gameHistory.unshift({
+      game: String(game || 'andar_bahar').trim(),
+      roundName: String(roundName || '').trim(),
+      side: String(side || '').trim(),
+      amount: Number(amount || 0),
+      status: String(status || 'Played').trim(),
+      createdAt: new Date()
+    });
+
+    if (user.gameHistory.length > 50) {
+      user.gameHistory = user.gameHistory.slice(0, 50);
+    }
+
+    await user.save();
+    return res.json({ success: true, message: 'History saved' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get('/api/history/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    return res.json({
+      success: true,
+      gameHistory: user.gameHistory || [],
+      transactions: (user.transactions || []).slice(0, 50)
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 10. Send live chat message + AI support reply
 app.post('/api/chat/send', async (req, res) => {
   try {
     const roomId = String((req.body && req.body.roomId) || 'support_default').trim();
@@ -817,7 +1044,7 @@ app.post('/api/chat/send', async (req, res) => {
   }
 });
 
-// 7. Fetch live chat messages for a room
+// 11. Fetch live chat messages for a room
 app.get('/api/chat/:roomId', (req, res) => {
   try {
     const roomId = String(req.params.roomId || 'support_default').trim();
