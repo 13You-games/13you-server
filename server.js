@@ -294,6 +294,7 @@ function formatUserResponse(user) {
     email: user.email || '',
     balance: Number(user.balance || 0),
     dailyStreak: Number(user.dailyStreak || 0)
+    hasDeposited: Boolean(user.hasDeposited)
   };
 }
 
@@ -423,6 +424,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         phone: cleanPhone,
         email,
         balance: 50,
+        hasDeposited: false,
         transactions: [{ type: 'credit', amount: 50, reason: 'welcome_bonus' }]
       });
     } else if (email && !user.email) {
@@ -765,27 +767,37 @@ app.post('/api/wallet/adjust', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Insufficient balance' });
     }
 
-    user.balance = type === 'credit' ? user.balance + numericAmount : user.balance - numericAmount;
-    user.transactions.unshift({
-      type,
-      amount: numericAmount,
-      reason: reason || 'game_action',
-      createdAt: new Date()
-    });
+   user.balance = type === 'credit' ? user.balance + numericAmount : user.balance - numericAmount;
 
-    await user.save();
+const cleanReason = String(reason || '').toLowerCase();
+if (type === 'credit' && (cleanReason === 'deposit' || cleanReason === 'add_cash' || cleanReason === 'addcash')) {
+  user.hasDeposited = true;
+}
 
-    res.json({
-      success: true,
-      balance: Number(user.balance || 0)
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
+user.transactions.unshift({
+  type,
+  amount: numericAmount,
+  reason: reason || 'game_action',
+  createdAt: new Date()
 });
+
+await user.save();
+
+res.json({
+        success: true,
+        balance: Number(user.balance || 0),
+        hasDeposited: Boolean(user.hasDeposited)
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
 // 6. Daily Bonus Status & Claim (24h cooldown, 7-day rewards)
 const DAILY_REWARDS = [10, 15, 20, 25, 30, 40, 50];
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+
 
 app.get('/api/bonus/daily-status/:userId', async (req, res) => {
   try {
