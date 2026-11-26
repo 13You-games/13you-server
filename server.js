@@ -293,7 +293,7 @@ function formatUserResponse(user) {
     phone: user.phone || '',
     email: user.email || '',
     balance: Number(user.balance || 0),
-    dailyStreak: Number(user.dailyStreak || 0)
+    dailyStreak: Number(user.dailyStreak || 0),
     hasDeposited: Boolean(user.hasDeposited)
   };
 }
