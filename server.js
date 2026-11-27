@@ -273,6 +273,7 @@ const userSchema = new mongoose.Schema(
     dob: { type: Date, default: getDefaultAdultDob },
     isAdultVerified: { type: Boolean, default: false },
     balance: { type: Number, default: 50, min: 0 },
+    hasDeposited: { type: Boolean, default: false },
     dailyStreak: { type: Number, default: 0, min: 0 },
     lastDailyClaimAt: { type: Date, default: null },
     usedPromos: { type: [String], default: [] },
@@ -751,47 +752,57 @@ app.get('/api/wallet/:userId', async (req, res) => {
 // 5. Adjust Balance (credit / debit)
 app.post('/api/wallet/adjust', async (req, res) => {
   try {
-    const { userId, type, amount, reason } = req.body;
+    const { userId, type, amount, reason } = req.body || {};
     const numericAmount = Number(amount);
 
-    if (!userId || !['credit', 'debit'].includes(type) || !numericAmount || numericAmount <= 0) {
+    if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    if (!['credit', 'debit'].includes(type) || !Number.isFinite(numericAmount) || numericAmount <= 0) {
       return res.status(400).json({ success: false, message: 'Invalid request fields' });
     }
 
     const user = await User.findById(userId);
     if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
+      return res.status(404).json({ success: false, message: 'No matching document found for id' });
     }
 
-    if (type === 'debit' && user.balance < numericAmount) {
+    const currentBalance = Number(user.balance || 0);
+    if (type === 'debit' && currentBalance < numericAmount) {
       return res.status(400).json({ success: false, message: 'Insufficient balance' });
     }
 
-   user.balance = type === 'credit' ? user.balance + numericAmount : user.balance - numericAmount;
+    const updatedBalance = type === 'credit'
+      ? currentBalance + numericAmount
+      : Math.max(0, currentBalance - numericAmount);
 
-const cleanReason = String(reason || '').toLowerCase();
-if (type === 'credit' && (cleanReason === 'deposit' || cleanReason === 'add_cash' || cleanReason === 'addcash')) {
-  user.hasDeposited = true;
-}
+    user.balance = updatedBalance;
 
-user.transactions.unshift({
-  type,
-  amount: numericAmount,
-  reason: reason || 'game_action',
-  createdAt: new Date()
-});
-
-await user.save();
-
-res.json({
-        success: true,
-        balance: Number(user.balance || 0),
-        hasDeposited: Boolean(user.hasDeposited)
-      });
-    } catch (err) {
-      res.status(500).json({ success: false, message: err.message });
+    const cleanReason = String(reason || '').trim().toLowerCase();
+    if (type === 'credit' && (cleanReason === 'deposit' || cleanReason === 'add_cash' || cleanReason === 'addcash')) {
+      user.hasDeposited = true;
     }
-  });
+
+    user.transactions.unshift({
+      type,
+      amount: numericAmount,
+      reason: reason || 'game_action',
+      createdAt: new Date()
+    });
+
+    await user.save();
+
+    return res.json({
+      success: true,
+      balance: Number(user.balance || 0),
+      hasDeposited: Boolean(user.hasDeposited)
+    });
+  } catch (err) {
+    console.error('[wallet/adjust error]:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // 6. Daily Bonus Status & Claim (24h cooldown, 7-day rewards)
 const DAILY_REWARDS = [10, 15, 20, 25, 30, 40, 50];
